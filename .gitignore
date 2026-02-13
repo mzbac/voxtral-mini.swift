@@ -1,0 +1,15 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/
+.netrc
+
+mem/
+build/
+temp/
+*.profraw
+
+.vscode
+scripts
