@@ -6,6 +6,7 @@ import MLXNN
 public enum VoxtralLoaderError: Error {
     case missingFile(URL)
     case unsupportedModelFormat(URL)
+    case invalidModelSpec(String)
 }
 
 private struct VoxtralQuantizationConfig: Decodable {
@@ -42,17 +43,38 @@ public enum VoxtralLoader {
         "tekken.json",
     ]
 
+    public static func resolveHuggingFaceHubCacheDirectory(downloadBasePath: String? = nil) -> URL {
+        if let downloadBasePath = normalizedNonEmpty(downloadBasePath) {
+            return normalizedPathURL(downloadBasePath)
+        }
+
+        let env = ProcessInfo.processInfo.environment
+        if let hubCache = normalizedNonEmpty(env["HF_HUB_CACHE"]) {
+            return normalizedPathURL(hubCache)
+        }
+        if let hfHome = normalizedNonEmpty(env["HF_HOME"]) {
+            return normalizedPathURL(hfHome).appendingPathComponent("hub").standardizedFileURL
+        }
+
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/hub")
+            .standardizedFileURL
+    }
+
     public static func downloadModel(
         modelID: String,
-        hubApi: HubApi = HubApi(),
+        revision: String = "main",
+        hubApi: HubApi? = nil,
         progressHandler: ((_ progress: Progress, _ speedBytesPerSec: Double?) -> Void)? = nil
     ) async throws -> URL {
         // Avoid false offline mode during short-lived CLI/test runs.
         setenv("CI_DISABLE_NETWORK_MONITOR", "1", 0)
 
+        let hubApi = hubApi ?? makeDefaultHubApi(downloadBasePath: nil)
+
         return try await hubApi.snapshot(
             from: modelID,
-            revision: "main",
+            revision: revision,
             matching: downloadGlobs,
             progressHandler: { progress, speed in
                 progressHandler?(progress, speed)
@@ -62,10 +84,47 @@ public enum VoxtralLoader {
 
     public static func load(
         modelID: String,
-        hubApi: HubApi = HubApi(),
+        revision: String = "main",
+        hubApi: HubApi? = nil,
         progressHandler: ((_ progress: Progress, _ speedBytesPerSec: Double?) -> Void)? = nil
     ) async throws -> VoxtralLoadedModel {
-        let directory = try await downloadModel(modelID: modelID, hubApi: hubApi, progressHandler: progressHandler)
+        let directory = try await downloadModel(
+            modelID: modelID,
+            revision: revision,
+            hubApi: hubApi,
+            progressHandler: progressHandler
+        )
+        return try load(directory: directory)
+    }
+
+    public static func load(
+        modelSpec: String,
+        defaultRevision: String = "main",
+        downloadBasePath: String? = nil,
+        progressHandler: ((_ progress: Progress, _ speedBytesPerSec: Double?) -> Void)? = nil
+    ) async throws -> VoxtralLoadedModel {
+        let localDirectory = normalizedPathURL(modelSpec)
+        if FileManager.default.fileExists(atPath: localDirectory.path) {
+            return try load(directory: localDirectory)
+        }
+
+        let (repoID, revision) = parseModelSpec(modelSpec, defaultRevision: defaultRevision)
+        guard isLikelyHuggingFaceModelID(repoID) else {
+            throw VoxtralLoaderError.invalidModelSpec(modelSpec)
+        }
+
+        let hubCacheDir = resolveHuggingFaceHubCacheDirectory(downloadBasePath: downloadBasePath)
+        if let cachedSnapshot = findCachedSnapshot(repoID: repoID, revision: revision, hubCacheDir: hubCacheDir) {
+            return try load(directory: cachedSnapshot)
+        }
+
+        let hubApi = makeDefaultHubApi(downloadBasePath: hubCacheDir.path)
+        let directory = try await downloadModel(
+            modelID: repoID,
+            revision: revision,
+            hubApi: hubApi,
+            progressHandler: progressHandler
+        )
         return try load(directory: directory)
     }
 
@@ -139,6 +198,147 @@ public enum VoxtralLoader {
         }
 
         throw VoxtralLoaderError.unsupportedModelFormat(directory)
+    }
+
+    private static func makeDefaultHubApi(downloadBasePath: String?) -> HubApi {
+        let base = resolveHuggingFaceHubCacheDirectory(downloadBasePath: downloadBasePath)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        return HubApi(downloadBase: base)
+    }
+
+    private static func parseModelSpec(_ modelSpec: String, defaultRevision: String) -> (repoID: String, revision: String) {
+        let parts = modelSpec.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        let repoID = String(parts[0])
+        if parts.count == 2 {
+            let revision = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (repoID, revision.isEmpty ? defaultRevision : revision)
+        }
+        return (repoID, defaultRevision)
+    }
+
+    private static func findCachedSnapshot(repoID: String, revision: String, hubCacheDir: URL) -> URL? {
+        let swiftPath = hubCacheDir
+            .appendingPathComponent("models")
+            .appendingPathComponent(repoID)
+            .standardizedFileURL
+        if isValidSnapshotDirectory(swiftPath) {
+            return swiftPath
+        }
+
+        let modelIDKey = repoID.replacingOccurrences(of: "/", with: "--")
+        let pythonBase = hubCacheDir
+            .appendingPathComponent("models--\(modelIDKey)")
+            .standardizedFileURL
+        if let pythonSnapshot = resolvePythonSnapshot(base: pythonBase, revision: revision),
+           isValidSnapshotDirectory(pythonSnapshot) {
+            return pythonSnapshot
+        }
+
+        return nil
+    }
+
+    private static func resolvePythonSnapshot(base: URL, revision: String) -> URL? {
+        let fm = FileManager.default
+        let snapshotsDir = base.appendingPathComponent("snapshots")
+        guard fm.fileExists(atPath: snapshotsDir.path) else {
+            return nil
+        }
+
+        let refPath = base.appendingPathComponent("refs").appendingPathComponent(revision)
+        if let data = try? Data(contentsOf: refPath),
+           let raw = String(data: data, encoding: .utf8)?
+           .trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            let revisionSnapshot = snapshotsDir.appendingPathComponent(raw)
+            if isValidSnapshotDirectory(revisionSnapshot) {
+                return revisionSnapshot
+            }
+        }
+
+        guard let snapshots = try? fm.contentsOfDirectory(
+            at: snapshotsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let sorted = snapshots.sorted { lhs, rhs in
+            let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return lhsDate > rhsDate
+        }
+        return sorted.first(where: isValidSnapshotDirectory(_:))
+    }
+
+    private static func isValidSnapshotDirectory(_ directory: URL) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: directory.path) else {
+            return false
+        }
+
+        let tekkenURL = directory.appendingPathComponent("tekken.json")
+        guard fm.fileExists(atPath: tekkenURL.path) else {
+            return false
+        }
+
+        let paramsURL = directory.appendingPathComponent("params.json")
+        let configURL = directory.appendingPathComponent("config.json")
+        guard fm.fileExists(atPath: paramsURL.path) || fm.fileExists(atPath: configURL.path) else {
+            return false
+        }
+
+        return directoryContainsSafetensors(directory)
+    }
+
+    private static func directoryContainsSafetensors(_ directory: URL) -> Bool {
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+            return false
+        }
+        return contents.contains { $0.pathExtension == "safetensors" }
+    }
+
+    private static func isLikelyHuggingFaceModelID(_ modelID: String) -> Bool {
+        if modelID.hasPrefix("/") || modelID.hasPrefix("./") || modelID.hasPrefix("../") || modelID.hasPrefix("~/") {
+            return false
+        }
+
+        let parts = modelID.split(separator: "/")
+        guard parts.count == 2 else {
+            return false
+        }
+
+        let org = String(parts[0])
+        let repo = String(parts[1])
+        guard !org.isEmpty && !repo.isEmpty else {
+            return false
+        }
+
+        let pathIndicators = [
+            "models", "model", "weights", "data", "datasets", "checkpoints", "output",
+            "tmp", "temp", "cache",
+        ]
+        if pathIndicators.contains(org.lowercased()) {
+            return false
+        }
+
+        if org.filter({ $0 == "." }).count > 1 {
+            return false
+        }
+
+        return true
+    }
+
+    private static func normalizedNonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func normalizedPathURL(_ path: String) -> URL {
+        URL(fileURLWithPath: NSString(string: path).expandingTildeInPath).standardizedFileURL
     }
 
     private static func loadSafetensors(in directory: URL) throws -> [String: MLXArray] {

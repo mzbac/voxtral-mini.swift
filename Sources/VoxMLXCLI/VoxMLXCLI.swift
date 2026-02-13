@@ -20,6 +20,12 @@ extension VoxMLXCLI {
         @Option(name: .long, help: "MLX allocator cache limit in MB (0 disables cache).")
         var mlxCacheLimitMb: Int = 2048
 
+        @Option(
+            name: .long,
+            help: "Hugging Face cache root. Precedence: --download-base-path > HF_HUB_CACHE > HF_HOME/hub > ~/.cache/huggingface/hub."
+        )
+        var downloadBasePath: String?
+
         @Flag(name: .shortAndLong, help: "Enable verbose setup logs (permissions/model/cache/download).")
         var verbose = false
     }
@@ -52,7 +58,11 @@ extension VoxMLXCLI {
             let cacheBytes = try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
             logVerbose(shared.verbose, "mlx cache limit: \(shared.mlxCacheLimitMb) MB (\(cacheBytes) bytes)")
             let audioURL = URL(fileURLWithPath: audio)
-            let transcriber = try await loadTranscriber(model: model, verbose: shared.verbose)
+            let transcriber = try await loadTranscriber(
+                model: model,
+                verbose: shared.verbose,
+                downloadBasePath: shared.downloadBasePath
+            )
             let result = try transcriber.transcribeWithStats(
                 audioURL: audioURL,
                 temperature: temp,
@@ -114,7 +124,11 @@ extension VoxMLXCLI {
             try await ensureMicrophonePermission(verbose: shared.verbose)
             let cacheBytes = try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
             logVerbose(shared.verbose, "mlx cache limit: \(shared.mlxCacheLimitMb) MB (\(cacheBytes) bytes)")
-            let transcriber = try await loadTranscriber(model: model, verbose: shared.verbose)
+            let transcriber = try await loadTranscriber(
+                model: model,
+                verbose: shared.verbose,
+                downloadBasePath: shared.downloadBasePath
+            )
             let session = try VoxtralRealtimeSession(
                 transcriber: transcriber,
                 temperature: temp,
@@ -192,41 +206,52 @@ private func configureMLXCacheLimit(cacheLimitMB: Int) throws -> Int {
     return bytes
 }
 
-private func loadTranscriber(model: String, verbose: Bool) async throws -> VoxtralTranscriber {
-    if FileManager.default.fileExists(atPath: model) {
-        let modelDirectory = URL(fileURLWithPath: model)
+private func loadTranscriber(model: String, verbose: Bool, downloadBasePath: String?) async throws -> VoxtralTranscriber {
+    let localModelPath = NSString(string: model).expandingTildeInPath
+    if FileManager.default.fileExists(atPath: localModelPath) {
+        let modelDirectory = URL(fileURLWithPath: localModelPath).standardizedFileURL
         logVerbose(verbose, "model source: local directory \(modelDirectory.path)")
         let loaded = try VoxtralLoader.load(directory: modelDirectory)
         logVerbose(verbose, "model loaded from: \(loaded.directory.path)")
         return VoxtralTranscriber(model: loaded.model, tokenizer: loaded.tokenizer, config: loaded.config)
     } else {
+        let cacheDirectory = VoxtralLoader.resolveHuggingFaceHubCacheDirectory(downloadBasePath: downloadBasePath)
         logVerbose(verbose, "model source: Hugging Face id \(model)")
+        logVerbose(verbose, "hugging face cache root: \(cacheDirectory.path)")
         logVerbose(verbose, "downloading model files if needed...")
 
         final class ProgressState {
             var lastBucket: Int = -1
         }
         let state = ProgressState()
-        let loaded = try await VoxtralLoader.load(modelID: model) { progress, speed in
-            guard verbose, progress.totalUnitCount > 0 else { return }
-            let fraction = max(0.0, min(1.0, progress.fractionCompleted))
-            let percent = Int((fraction * 100.0).rounded())
-            let bucket = percent / 5
-            guard bucket > state.lastBucket || percent >= 100 else { return }
-            state.lastBucket = bucket
+        let loaded: VoxtralLoadedModel
+        do {
+            loaded = try await VoxtralLoader.load(
+                modelSpec: model,
+                downloadBasePath: downloadBasePath
+            ) { progress, speed in
+                guard verbose, progress.totalUnitCount > 0 else { return }
+                let fraction = max(0.0, min(1.0, progress.fractionCompleted))
+                let percent = Int((fraction * 100.0).rounded())
+                let bucket = percent / 5
+                guard bucket > state.lastBucket || percent >= 100 else { return }
+                state.lastBucket = bucket
 
-            if let speed, speed > 0 {
-                fputs(
-                    String(
-                        format: "[voxmlx] model download: %3d%% (%.1f MiB/s)\n",
-                        percent,
-                        speed / (1024.0 * 1024.0)
-                    ),
-                    stderr
-                )
-            } else {
-                fputs(String(format: "[voxmlx] model download: %3d%%\n", percent), stderr)
+                if let speed, speed > 0 {
+                    fputs(
+                        String(
+                            format: "[voxmlx] model download: %3d%% (%.1f MiB/s)\n",
+                            percent,
+                            speed / (1024.0 * 1024.0)
+                        ),
+                        stderr
+                    )
+                } else {
+                    fputs(String(format: "[voxmlx] model download: %3d%%\n", percent), stderr)
+                }
             }
+        } catch VoxtralLoaderError.invalidModelSpec {
+            throw ValidationError("Model not found locally and is not a valid Hugging Face repo id: \(model)")
         }
         logVerbose(verbose, "model loaded from cache directory: \(loaded.directory.path)")
         return VoxtralTranscriber(model: loaded.model, tokenizer: loaded.tokenizer, config: loaded.config)

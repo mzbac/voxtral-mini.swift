@@ -37,7 +37,7 @@ public final class VoxtralTranscriber: @unchecked Sendable {
 
     public static func load(
         modelID: String = VoxtralLoader.defaultModelID,
-        hubApi: HubApi = HubApi()
+        hubApi: HubApi? = nil
     ) async throws -> VoxtralTranscriber {
         let loaded = try await VoxtralLoader.load(modelID: modelID, hubApi: hubApi)
         return VoxtralTranscriber(model: loaded.model, tokenizer: loaded.tokenizer, config: loaded.config)
