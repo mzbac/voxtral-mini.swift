@@ -17,7 +17,19 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: 16.0
+          xcode-version: 17.0
+
+      - name: Verify Swift version
+        run: |
+          swift --version
+          swift_version="$(swift --version | awk '/Swift version/{print $3}')"
+          major="${swift_version%%.*}"
+          remainder="${swift_version#*.}"
+          minor="${remainder%%.*}"
+          if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 2 ]; }; then
+            echo "CI requires Swift 6.2+; got ${swift_version}" >&2
+            exit 1
+          fi
 
       - name: Enable PrepareMetalShaders plugin
         run: defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
@@ -47,7 +59,19 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: 16.0
+          xcode-version: 17.0
+
+      - name: Verify Swift version
+        run: |
+          swift --version
+          swift_version="$(swift --version | awk '/Swift version/{print $3}')"
+          major="${swift_version%%.*}"
+          remainder="${swift_version#*.}"
+          minor="${remainder%%.*}"
+          if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 2 ]; }; then
+            echo "CI requires Swift 6.2+; got ${swift_version}" >&2
+            exit 1
+          fi
 
       - name: Enable PrepareMetalShaders plugin
         run: defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
