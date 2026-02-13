@@ -19,6 +19,9 @@ extension VoxMLXCLI {
     struct SharedOptions: ParsableArguments {
         @Option(name: .long, help: "MLX allocator cache limit in MB (0 disables cache).")
         var mlxCacheLimitMb: Int = 2048
+
+        @Flag(name: .shortAndLong, help: "Enable verbose setup logs (permissions/model/cache/download).")
+        var verbose = false
     }
 
     struct Transcribe: AsyncParsableCommand {
@@ -46,9 +49,10 @@ extension VoxMLXCLI {
         var stats = false
 
         mutating func run() async throws {
-            try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
+            let cacheBytes = try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
+            logVerbose(shared.verbose, "mlx cache limit: \(shared.mlxCacheLimitMb) MB (\(cacheBytes) bytes)")
             let audioURL = URL(fileURLWithPath: audio)
-            let transcriber = try await loadTranscriber(model: model)
+            let transcriber = try await loadTranscriber(model: model, verbose: shared.verbose)
             let result = try transcriber.transcribeWithStats(
                 audioURL: audioURL,
                 temperature: temp,
@@ -107,8 +111,10 @@ extension VoxMLXCLI {
         var maxBacklogMs: Float = 400
 
         mutating func run() async throws {
-            try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
-            let transcriber = try await loadTranscriber(model: model)
+            try await ensureMicrophonePermission(verbose: shared.verbose)
+            let cacheBytes = try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
+            logVerbose(shared.verbose, "mlx cache limit: \(shared.mlxCacheLimitMb) MB (\(cacheBytes) bytes)")
+            let transcriber = try await loadTranscriber(model: model, verbose: shared.verbose)
             let session = try VoxtralRealtimeSession(
                 transcriber: transcriber,
                 temperature: temp,
@@ -147,7 +153,34 @@ extension VoxMLXCLI {
     }
 }
 
-private func configureMLXCacheLimit(cacheLimitMB: Int) throws {
+private func ensureMicrophonePermission(verbose: Bool) async throws {
+    let deniedMessage =
+        "Microphone access is required for `live`. Enable it in System Settings > Privacy & Security > Microphone."
+
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+        logVerbose(verbose, "microphone permission: authorized")
+        return
+    case .notDetermined:
+        logVerbose(verbose, "microphone permission: requesting access...")
+        let granted = await withCheckedContinuation { continuation in
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                continuation.resume(returning: granted)
+            }
+        }
+        if !granted {
+            throw CleanExit.message(deniedMessage)
+        }
+        logVerbose(verbose, "microphone permission: granted")
+    case .denied, .restricted:
+        logVerbose(verbose, "microphone permission: denied/restricted")
+        throw CleanExit.message(deniedMessage)
+    @unknown default:
+        throw CleanExit.message("Unable to determine microphone permission status.")
+    }
+}
+
+private func configureMLXCacheLimit(cacheLimitMB: Int) throws -> Int {
     guard cacheLimitMB >= 0 else {
         throw ValidationError("--mlx-cache-limit-mb must be >= 0.")
     }
@@ -156,14 +189,53 @@ private func configureMLXCacheLimit(cacheLimitMB: Int) throws {
         throw ValidationError("--mlx-cache-limit-mb is too large.")
     }
     Memory.cacheLimit = bytes
+    return bytes
 }
 
-private func loadTranscriber(model: String) async throws -> VoxtralTranscriber {
+private func loadTranscriber(model: String, verbose: Bool) async throws -> VoxtralTranscriber {
     if FileManager.default.fileExists(atPath: model) {
-        return try VoxtralTranscriber.load(from: URL(fileURLWithPath: model))
+        let modelDirectory = URL(fileURLWithPath: model)
+        logVerbose(verbose, "model source: local directory \(modelDirectory.path)")
+        let loaded = try VoxtralLoader.load(directory: modelDirectory)
+        logVerbose(verbose, "model loaded from: \(loaded.directory.path)")
+        return VoxtralTranscriber(model: loaded.model, tokenizer: loaded.tokenizer, config: loaded.config)
     } else {
-        return try await VoxtralTranscriber.load(modelID: model)
+        logVerbose(verbose, "model source: Hugging Face id \(model)")
+        logVerbose(verbose, "downloading model files if needed...")
+
+        final class ProgressState {
+            var lastBucket: Int = -1
+        }
+        let state = ProgressState()
+        let loaded = try await VoxtralLoader.load(modelID: model) { progress, speed in
+            guard verbose, progress.totalUnitCount > 0 else { return }
+            let fraction = max(0.0, min(1.0, progress.fractionCompleted))
+            let percent = Int((fraction * 100.0).rounded())
+            let bucket = percent / 5
+            guard bucket > state.lastBucket || percent >= 100 else { return }
+            state.lastBucket = bucket
+
+            if let speed, speed > 0 {
+                fputs(
+                    String(
+                        format: "[voxmlx] model download: %3d%% (%.1f MiB/s)\n",
+                        percent,
+                        speed / (1024.0 * 1024.0)
+                    ),
+                    stderr
+                )
+            } else {
+                fputs(String(format: "[voxmlx] model download: %3d%%\n", percent), stderr)
+            }
+        }
+        logVerbose(verbose, "model loaded from cache directory: \(loaded.directory.path)")
+        return VoxtralTranscriber(model: loaded.model, tokenizer: loaded.tokenizer, config: loaded.config)
     }
+}
+
+private func logVerbose(_ enabled: Bool, _ message: @autoclosure () -> String) {
+    guard enabled else { return }
+    fputs("[voxmlx] \(message())\n", stderr)
 }
 
 private final class MicrophoneChunkSource {

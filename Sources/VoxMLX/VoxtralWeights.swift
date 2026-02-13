@@ -42,7 +42,11 @@ public enum VoxtralLoader {
         "tekken.json",
     ]
 
-    public static func downloadModel(modelID: String, hubApi: HubApi = HubApi()) async throws -> URL {
+    public static func downloadModel(
+        modelID: String,
+        hubApi: HubApi = HubApi(),
+        progressHandler: ((_ progress: Progress, _ speedBytesPerSec: Double?) -> Void)? = nil
+    ) async throws -> URL {
         // Avoid false offline mode during short-lived CLI/test runs.
         setenv("CI_DISABLE_NETWORK_MONITOR", "1", 0)
 
@@ -50,12 +54,18 @@ public enum VoxtralLoader {
             from: modelID,
             revision: "main",
             matching: downloadGlobs,
-            progressHandler: { _ in }
+            progressHandler: { progress, speed in
+                progressHandler?(progress, speed)
+            }
         )
     }
 
-    public static func load(modelID: String, hubApi: HubApi = HubApi()) async throws -> VoxtralLoadedModel {
-        let directory = try await downloadModel(modelID: modelID, hubApi: hubApi)
+    public static func load(
+        modelID: String,
+        hubApi: HubApi = HubApi(),
+        progressHandler: ((_ progress: Progress, _ speedBytesPerSec: Double?) -> Void)? = nil
+    ) async throws -> VoxtralLoadedModel {
+        let directory = try await downloadModel(modelID: modelID, hubApi: hubApi, progressHandler: progressHandler)
         return try load(directory: directory)
     }
 
