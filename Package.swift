@@ -35,6 +35,7 @@ let package = Package(
             name: "VoxMLXCLI",
             dependencies: [
                 "VoxMLX",
+                .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/VoxMLXCLI"

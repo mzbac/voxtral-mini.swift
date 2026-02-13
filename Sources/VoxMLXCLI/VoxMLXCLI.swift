@@ -2,6 +2,7 @@ import ArgumentParser
 import AVFoundation
 import Darwin
 import Foundation
+import MLX
 import VoxMLX
 
 @main
@@ -15,11 +16,19 @@ struct VoxMLXCLI: AsyncParsableCommand {
 }
 
 extension VoxMLXCLI {
+    struct SharedOptions: ParsableArguments {
+        @Option(name: .long, help: "MLX allocator cache limit in MB (0 disables cache).")
+        var mlxCacheLimitMb: Int = 2048
+    }
+
     struct Transcribe: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "transcribe",
             abstract: "Transcribe an audio file."
         )
+
+        @OptionGroup
+        var shared: SharedOptions
 
         @Option(name: .long, help: "Path to audio file (wav/flac/mp3/etc).")
         var audio: String
@@ -37,6 +46,7 @@ extension VoxMLXCLI {
         var stats = false
 
         mutating func run() async throws {
+            try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
             let audioURL = URL(fileURLWithPath: audio)
             let transcriber = try await loadTranscriber(model: model)
             let result = try transcriber.transcribeWithStats(
@@ -72,6 +82,9 @@ extension VoxMLXCLI {
             abstract: "Realtime transcription from microphone."
         )
 
+        @OptionGroup
+        var shared: SharedOptions
+
         @Option(name: .long, help: "Model ID on Hugging Face, or local model directory path.")
         var model: String = VoxtralLoader.defaultRealtimeModelID
 
@@ -94,6 +107,7 @@ extension VoxMLXCLI {
         var maxBacklogMs: Float = 400
 
         mutating func run() async throws {
+            try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
             let transcriber = try await loadTranscriber(model: model)
             let session = try VoxtralRealtimeSession(
                 transcriber: transcriber,
@@ -131,6 +145,17 @@ extension VoxMLXCLI {
             fflush(stdout)
         }
     }
+}
+
+private func configureMLXCacheLimit(cacheLimitMB: Int) throws {
+    guard cacheLimitMB >= 0 else {
+        throw ValidationError("--mlx-cache-limit-mb must be >= 0.")
+    }
+    let (bytes, overflow) = cacheLimitMB.multipliedReportingOverflow(by: 1024 * 1024)
+    guard !overflow else {
+        throw ValidationError("--mlx-cache-limit-mb is too large.")
+    }
+    Memory.cacheLimit = bytes
 }
 
 private func loadTranscriber(model: String) async throws -> VoxtralTranscriber {
