@@ -94,13 +94,12 @@ extension VoxMLXCLI {
         var maxBacklogMs: Float = 400
 
         mutating func run() async throws {
-            let effectiveTranscriptionDelayMs = transcriptionDelayMs ?? 0
             let transcriber = try await loadTranscriber(model: model)
             let session = try VoxtralRealtimeSession(
                 transcriber: transcriber,
                 temperature: temp,
                 chunkDurationMs: chunkMs,
-                transcriptionDelayMs: effectiveTranscriptionDelayMs,
+                transcriptionDelayMs: transcriptionDelayMs,
                 rightPadTokens: rightPadTokens,
                 decoderWindowTokens: decoderWindow
             )
