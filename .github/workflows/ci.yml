@@ -17,12 +17,16 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: 17.0
+          xcode-version: '26.2'
 
       - name: Verify Swift version
         run: |
           swift --version
-          swift_version="$(swift --version | awk '/Swift version/{print $3}')"
+          swift_version="$(swift --version | grep -Eo 'Swift version [0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | awk '{print $3}')"
+          if [ -z "$swift_version" ]; then
+            echo "Unable to parse Swift version from toolchain output" >&2
+            exit 1
+          fi
           major="${swift_version%%.*}"
           remainder="${swift_version#*.}"
           minor="${remainder%%.*}"
@@ -59,12 +63,16 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: 17.0
+          xcode-version: '26.2'
 
       - name: Verify Swift version
         run: |
           swift --version
-          swift_version="$(swift --version | awk '/Swift version/{print $3}')"
+          swift_version="$(swift --version | grep -Eo 'Swift version [0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | awk '{print $3}')"
+          if [ -z "$swift_version" ]; then
+            echo "Unable to parse Swift version from toolchain output" >&2
+            exit 1
+          fi
           major="${swift_version%%.*}"
           remainder="${swift_version#*.}"
           minor="${remainder%%.*}"
