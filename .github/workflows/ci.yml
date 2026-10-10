@@ -56,6 +56,7 @@ jobs:
           TEST_RUNNER_VOXMLX_TEST_DEVICE: cpu
         run: |
           set -o pipefail
+          mkdir -p ./build
           xcodebuild test -scheme VoxMLX-Package -destination 'platform=macOS' -derivedDataPath ./build -resultBundlePath ./build/VoxMLXTests.xcresult -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO 2>&1 | tee ./build/xcodebuild-test.log
 
       - name: Summarize test failures
