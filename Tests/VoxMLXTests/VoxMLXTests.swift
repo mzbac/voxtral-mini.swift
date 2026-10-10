@@ -45,6 +45,8 @@ func tokenizerDecodeIgnoresControlSpecialTokens() throws {
     #expect(text == "A")
 }
 
+extension MLXTests {
+
 @Test
 func audioMelShapeLooksReasonable() {
     let durationSeconds: Float = 1.0
@@ -109,4 +111,6 @@ func rotatingKVCachePrefillThenDecodeOrder() {
     #expect(cache.offset == 5)
     #expect(keyTokens == [5, 2, 3, 4])
     #expect(valueTokens == [50, 20, 30, 40])
+}
+
 }

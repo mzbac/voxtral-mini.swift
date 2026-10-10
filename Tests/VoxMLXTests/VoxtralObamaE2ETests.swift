@@ -69,6 +69,8 @@ private struct ObamaDatasetRowsResponse: Decodable {
     let rows: [RowContainer]
 }
 
+extension MLXTests {
+
 @Test
 func obamaVoiceDatasetEndToEnd() async throws {
     guard ObamaE2EConfig.shouldRun() else {
@@ -107,4 +109,6 @@ func obamaVoiceDatasetEndToEnd() async throws {
     let normalized = text.lowercased()
     #expect(normalized.contains("three years ago in our state of wisconsin"))
     #expect(normalized.contains("sikh temple"))
+}
+
 }

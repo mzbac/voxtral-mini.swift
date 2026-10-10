@@ -16,57 +16,90 @@ public enum VoxtralAudio {
     public static let globalLogMelMax: Float = 1.5
     public static let samplesPerToken = hopLength * 2 * 4  // hop * conv stride * downsample
 
+    /// Loads an audio file, downmixes it to mono and resamples it to ``sampleRate``.
+    ///
+    /// The file is read in bounded chunks so that memory stays proportional to the
+    /// *output* length rather than to the source's sample rate and channel count.
     public static func loadAudio(url: URL) throws -> [Float] {
         let audioFile = try AVAudioFile(forReading: url)
         let sourceFormat = audioFile.processingFormat
-        let frameCount = AVAudioFrameCount(audioFile.length)
 
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sourceFormat.sampleRate,
-            channels: sourceFormat.channelCount,
-            interleaved: false
-        ) else {
+        guard sourceFormat.commonFormat == .pcmFormatFloat32, sourceFormat.channelCount > 0 else {
             throw VoxtralAudioError.unsupportedAudioFormat(url)
         }
 
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+        let readChunkFrames: AVAudioFrameCount = 1 << 16
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: readChunkFrames) else {
             throw VoxtralAudioError.failedToReadAudio(url)
         }
 
-        try audioFile.read(into: buffer)
+        let sourceRate = Int(sourceFormat.sampleRate.rounded())
+        guard sourceRate > 0 else {
+            throw VoxtralAudioError.unsupportedAudioFormat(url)
+        }
 
-        let channels = Int(format.channelCount)
+        let resampler = VoxtralAudioResampler(inputRate: sourceRate, outputRate: sampleRate)
+        let expectedOutput = Int((Double(audioFile.length) * Double(sampleRate) / Double(sourceRate)).rounded(.up))
+
+        var output: [Float] = []
+        output.reserveCapacity(max(0, expectedOutput) + 1024)
+        var mono: [Float] = []
+
+        while audioFile.framePosition < audioFile.length {
+            buffer.frameLength = 0
+            try audioFile.read(into: buffer, frameCount: readChunkFrames)
+            guard buffer.frameLength > 0 else { break }
+
+            monoSamples(from: buffer, into: &mono)
+            output.append(contentsOf: resampler.process(mono))
+        }
+        output.append(contentsOf: resampler.finish())
+
+        return output
+    }
+
+    /// Downmixes every channel of `buffer` into a mono signal (channel average).
+    public static func monoSamples(from buffer: AVAudioPCMBuffer) -> [Float] {
+        var out: [Float] = []
+        monoSamples(from: buffer, into: &out)
+        return out
+    }
+
+    /// Downmixes every channel of `buffer` into `out`, reusing its storage.
+    public static func monoSamples(from buffer: AVAudioPCMBuffer, into out: inout [Float]) {
         let frames = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
 
-        guard channels > 0, frames > 0, let channelData = buffer.floatChannelData else {
-            throw VoxtralAudioError.failedToReadAudio(url)
+        if out.count != frames {
+            out = Array(repeating: 0, count: frames)
+        }
+        guard frames > 0, channels > 0, let channelData = buffer.floatChannelData else {
+            return
         }
 
-        var mono = Array(repeating: Float(0), count: frames)
-        if channels == 1 {
-            let src = channelData[0]
-            for i in 0 ..< frames {
-                mono[i] = src[i]
+        out.withUnsafeMutableBufferPointer { dst in
+            guard let dstBase = dst.baseAddress else { return }
+            let n = vDSP_Length(frames)
+
+            if channels == 1 {
+                dstBase.update(from: channelData[0], count: frames)
+                return
             }
-        } else {
-            for c in 0 ..< channels {
-                let src = channelData[c]
-                for i in 0 ..< frames {
-                    mono[i] += src[i]
+
+            vDSP_vclr(dstBase, 1, n)
+            if buffer.format.isInterleaved {
+                for channel in 0 ..< channels {
+                    vDSP_vadd(channelData[0] + channel, vDSP_Stride(channels), dstBase, 1, dstBase, 1, n)
+                }
+            } else {
+                for channel in 0 ..< channels {
+                    vDSP_vadd(channelData[channel], 1, dstBase, 1, dstBase, 1, n)
                 }
             }
-            let inv = 1.0 / Float(channels)
-            for i in 0 ..< frames {
-                mono[i] *= inv
-            }
-        }
 
-        let sr = Int(round(format.sampleRate))
-        if sr == sampleRate {
-            return mono
+            var scale = 1.0 / Float(channels)
+            vDSP_vsmul(dstBase, 1, &scale, dstBase, 1, n)
         }
-        return linearResample(samples: mono, inputRate: sr, outputRate: sampleRate)
     }
 
     public static func padAudio(
@@ -97,38 +130,45 @@ public enum VoxtralAudio {
         audioChunk: [Float],
         audioTail: [Float]?
     ) -> (mel: MLXArray, newTail: [Float]) {
-        let tailLen = nFFT - hopLength  // 240
-
         let combined: [Float]
         if let audioTail {
             combined = audioTail + audioChunk
         } else {
-            // First call includes STFT left padding.
+            // First call includes the STFT left padding.
             combined = Array(repeating: Float(0), count: nFFT / 2) + audioChunk
         }
 
-        let newTail: [Float]
-        if combined.count <= tailLen {
-            newTail = combined
-        } else {
-            newTail = Array(combined.suffix(tailLen))
-        }
-
         let (mel, frameCount) = computeLogMel(audio: combined, centerPad: false, dropLastFrame: false)
+
+        // Every frame starts at a multiple of `hopLength`; everything from the first
+        // frame start that did not fit is carried over so the next call continues on
+        // exactly the same frame grid as the offline spectrogram. A fixed-size tail
+        // (nFFT - hopLength) is only correct when the leftover happens to align, and
+        // otherwise silently drops samples and shifts every later frame.
+        let consumed = frameCount * hopLength
+        let newTail = Array(combined[consumed...])
+
         if frameCount == 0 {
             return (MLXArray.zeros([nMels, 0], dtype: .float32), newTail)
         }
         return (MLXArray(mel).reshaped(nMels, frameCount), newTail)
     }
 
+    /// One-shot resampling of a complete signal to ``sampleRate``.
+    ///
+    /// For streaming input (e.g. microphone buffers) use ``VoxtralAudioResampler`` so
+    /// filter state carries across calls and the fractional phase does not drift.
     public static func resampleToModelRate(_ samples: [Float], inputRate: Int) -> [Float] {
         if inputRate == sampleRate {
             return samples
         }
-        return linearResample(samples: samples, inputRate: inputRate, outputRate: sampleRate)
+        let resampler = VoxtralAudioResampler(inputRate: inputRate, outputRate: sampleRate)
+        var out = resampler.process(samples)
+        out.append(contentsOf: resampler.finish())
+        return out
     }
 
-    private static func linearResample(samples: [Float], inputRate: Int, outputRate: Int) -> [Float] {
+    static func linearResample(samples: [Float], inputRate: Int, outputRate: Int) -> [Float] {
         guard !samples.isEmpty, inputRate > 0, outputRate > 0 else { return [] }
         if inputRate == outputRate { return samples }
 
@@ -226,10 +266,11 @@ public enum VoxtralAudio {
 
         let n = samples.count
         var out = Array(repeating: Float(0), count: n + pad * 2)
+        out.replaceSubrange(pad ..< (pad + n), with: samples)
 
-        for outIndex in out.indices {
-            let sourceIndex = reflectedIndex(outIndex - pad, length: n)
-            out[outIndex] = samples[sourceIndex]
+        for i in 0 ..< pad {
+            out[pad - 1 - i] = samples[reflectedIndex(1 + i, length: n)]
+            out[pad + n + i] = samples[reflectedIndex(n - 2 - i, length: n)]
         }
 
         return out
@@ -403,5 +444,135 @@ private enum SpectrogramCache {
         }
 
         return filters
+    }
+}
+
+/// Streaming sample-rate converter built on `AVAudioConverter`.
+///
+/// Unlike per-buffer linear interpolation, the converter applies a proper
+/// anti-aliasing filter and keeps its state between calls, so a microphone stream
+/// fed in arbitrary buffer sizes neither aliases nor drifts. Call ``finish()`` once
+/// at end of stream to flush the filter delay.
+public final class VoxtralAudioResampler: @unchecked Sendable {
+    public let inputRate: Int
+    public let outputRate: Int
+
+    private let converter: AVAudioConverter?
+    private let inputFormat: AVAudioFormat?
+    private let outputFormat: AVAudioFormat?
+    private let lock = NSLock()
+
+    public init(inputRate: Int, outputRate: Int = VoxtralAudio.sampleRate) {
+        self.inputRate = inputRate
+        self.outputRate = outputRate
+
+        if inputRate != outputRate, inputRate > 0, outputRate > 0,
+           let inFormat = AVAudioFormat(
+               commonFormat: .pcmFormatFloat32,
+               sampleRate: Double(inputRate),
+               channels: 1,
+               interleaved: false
+           ),
+           let outFormat = AVAudioFormat(
+               commonFormat: .pcmFormatFloat32,
+               sampleRate: Double(outputRate),
+               channels: 1,
+               interleaved: false
+           ),
+           let converter = AVAudioConverter(from: inFormat, to: outFormat)
+        {
+            converter.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+            self.converter = converter
+            self.inputFormat = inFormat
+            self.outputFormat = outFormat
+        } else {
+            self.converter = nil
+            self.inputFormat = nil
+            self.outputFormat = nil
+        }
+    }
+
+    /// True when no conversion is needed (or possible) and samples pass through unchanged.
+    public var isPassthrough: Bool {
+        converter == nil
+    }
+
+    /// Converts the next block of input samples. Output length may differ from
+    /// `samples.count * outputRate / inputRate` for a single call; totals converge.
+    public func process(_ samples: [Float]) -> [Float] {
+        guard !samples.isEmpty else { return [] }
+        guard let converter, let inputFormat, let outputFormat else {
+            if inputRate == outputRate || inputRate <= 0 || outputRate <= 0 {
+                return samples
+            }
+            return VoxtralAudio.linearResample(samples: samples, inputRate: inputRate, outputRate: outputRate)
+        }
+
+        guard let input = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(samples.count)),
+              let channel = input.floatChannelData
+        else {
+            return []
+        }
+        input.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { src in
+            channel[0].update(from: src.baseAddress!, count: samples.count)
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        return drain(converter: converter, outputFormat: outputFormat, input: input, endOfStream: false)
+    }
+
+    /// Flushes any samples held in the converter's filter delay and resets it for reuse.
+    public func finish() -> [Float] {
+        guard let converter, let outputFormat else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        let out = drain(converter: converter, outputFormat: outputFormat, input: nil, endOfStream: true)
+        converter.reset()
+        return out
+    }
+
+    private func drain(
+        converter: AVAudioConverter,
+        outputFormat: AVAudioFormat,
+        input: AVAudioPCMBuffer?,
+        endOfStream: Bool
+    ) -> [Float] {
+        let ratio = Double(outputRate) / Double(inputRate)
+        let inputFrames = Int(input?.frameLength ?? 0)
+        let capacity = AVAudioFrameCount(max(256, Int((Double(inputFrames) * ratio).rounded(.up)) + 256))
+
+        var result: [Float] = []
+        var inputDelivered = false
+
+        while true {
+            guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else { break }
+
+            var error: NSError?
+            let status = converter.convert(to: output, error: &error) { _, outStatus in
+                if let input, !inputDelivered {
+                    inputDelivered = true
+                    outStatus.pointee = .haveData
+                    return input
+                }
+                outStatus.pointee = endOfStream ? .endOfStream : .noDataNow
+                return nil
+            }
+
+            if status == .error {
+                break
+            }
+
+            let produced = Int(output.frameLength)
+            if produced > 0, let channel = output.floatChannelData {
+                result.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: produced))
+            }
+
+            // `.haveData` means the output buffer filled up and more may be pending.
+            guard status == .haveData, produced == Int(capacity) else { break }
+        }
+
+        return result
     }
 }

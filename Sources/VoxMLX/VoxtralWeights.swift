@@ -145,7 +145,7 @@ public enum VoxtralLoader {
 
             let raw = try loadSafetensors(in: directory)
             let mapped = remapOriginalWeights(raw)
-            try model.update(parameters: ModuleParameters.unflattened(mapped), verify: .none)
+            try model.update(parameters: ModuleParameters.unflattened(mapped), verify: weightVerification)
             eval(model)
 
             return VoxtralLoadedModel(
@@ -186,7 +186,7 @@ public enum VoxtralLoader {
             }
 
             let raw = try loadSafetensors(in: directory)
-            try model.update(parameters: ModuleParameters.unflattened(raw), verify: .none)
+            try model.update(parameters: ModuleParameters.unflattened(raw), verify: weightVerification)
             eval(model)
 
             return VoxtralLoadedModel(
@@ -199,6 +199,11 @@ public enum VoxtralLoader {
 
         throw VoxtralLoaderError.unsupportedModelFormat(directory)
     }
+
+    /// Every parameter in the model must be present in the checkpoint with a matching
+    /// shape. Without this, a truncated download or a stale weight remap leaves random
+    /// initializers in place and the model silently produces garbage.
+    private static let weightVerification: Module.VerifyUpdate = [.allModelKeysSet, .shapeMismatch]
 
     private static func makeDefaultHubApi(downloadBasePath: String?) -> HubApi {
         let base = resolveHuggingFaceHubCacheDirectory(downloadBasePath: downloadBasePath)

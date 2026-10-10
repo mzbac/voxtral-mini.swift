@@ -85,6 +85,25 @@ public final class VoxtralRealtimeSession: @unchecked Sendable {
         eval([textEmbeds, tCond] + adaScales)
     }
 
+    /// Pushes a short burst of silence through the whole streaming pipeline (mel,
+    /// encoder, prefill, a few decode steps) and then resets, so that Metal pipeline
+    /// creation and first-touch costs are paid before real audio arrives. Returns the
+    /// wall-clock seconds spent.
+    @discardableResult
+    public func warmUp() -> Double {
+        let start = DispatchTime.now().uptimeNanoseconds
+        let chunkTokens = max(1, chunkSamples / VoxtralAudio.samplesPerToken)
+        let tokensToPrefill = max(0, prefixLength - leftPadTokens)
+        let chunks = (tokensToPrefill + chunkTokens - 1) / chunkTokens + 3
+        let silence = Array(repeating: Float(0), count: chunkSamples)
+        for _ in 0 ..< chunks {
+            _ = appendAudioSamples(silence)
+        }
+        _ = finishStream()
+        resetAllState()
+        return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+    }
+
     public func appendAudioSamples(_ samples: [Float]) -> String {
         if !samples.isEmpty {
             pendingAudio.append(contentsOf: samples)
@@ -295,11 +314,16 @@ public final class VoxtralRealtimeSession: @unchecked Sendable {
         )
         guard !pendingDecodedBytes.isEmpty else { return "" }
 
-        if let text = String(data: pendingDecodedBytes, encoding: .utf8) {
-            pendingDecodedBytes.removeAll(keepingCapacity: true)
-            return text
-        }
-        return ""
+        // Emit everything up to a possibly incomplete trailing UTF-8 sequence. Only a
+        // genuinely unfinished sequence is held back, so an invalid byte can never
+        // block output until end of stream; it is decoded as U+FFFD instead.
+        let held = UTF8StreamDecoder.incompleteSuffixLength(of: pendingDecodedBytes)
+        let completeCount = pendingDecodedBytes.count - held
+        guard completeCount > 0 else { return "" }
+
+        let text = String(decoding: pendingDecodedBytes.prefix(completeCount), as: UTF8.self)
+        pendingDecodedBytes = Data(pendingDecodedBytes.suffix(held))
+        return text
     }
 
     private func flushPendingDecodedBytes() -> String {
@@ -337,5 +361,41 @@ public final class VoxtralRealtimeSession: @unchecked Sendable {
         prefilled = false
 
         pendingDecodedBytes.removeAll(keepingCapacity: true)
+    }
+}
+
+enum UTF8StreamDecoder {
+    /// Number of trailing bytes that form the start of a UTF-8 sequence whose
+    /// continuation bytes have not arrived yet (0 when the buffer ends cleanly or
+    /// ends in bytes that can never become valid).
+    static func incompleteSuffixLength(of bytes: Data) -> Int {
+        let count = bytes.count
+        guard count > 0 else { return 0 }
+
+        // A sequence is at most 4 bytes, so only the last 3 bytes can be incomplete.
+        let window = min(3, count)
+        for back in 1 ... window {
+            let byte = bytes[bytes.index(bytes.endIndex, offsetBy: -back)]
+            if byte & 0b1100_0000 == 0b1000_0000 {
+                continue  // continuation byte, keep looking for its lead byte
+            }
+
+            let needed: Int
+            if byte & 0b1000_0000 == 0 {
+                needed = 1
+            } else if byte & 0b1110_0000 == 0b1100_0000 {
+                needed = 2
+            } else if byte & 0b1111_0000 == 0b1110_0000 {
+                needed = 3
+            } else if byte & 0b1111_1000 == 0b1111_0000 {
+                needed = 4
+            } else {
+                return 0  // invalid lead byte: nothing to wait for
+            }
+
+            return back < needed ? back : 0
+        }
+
+        return 0
     }
 }

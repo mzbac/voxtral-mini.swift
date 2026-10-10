@@ -216,6 +216,11 @@ final class VoxtralWhisperEncoder: Module {
         return x
     }
 
+    /// Runs the two front-end convolutions incrementally.
+    ///
+    /// Each stage keeps exactly the input frames that have not yet served as a window
+    /// start (`input[stride * outputs ...]`), so chaining steps over arbitrary chunk
+    /// sizes reproduces ``forwardConv`` on the concatenated input frame-for-frame.
     func forwardConvStep(
         _ newMel: MLXArray,
         conv1Tail: MLXArray?,
@@ -228,10 +233,7 @@ final class VoxtralWhisperEncoder: Module {
         } else {
             conv1Input = causalPad(newMel, amount: 2)
         }
-
-        let conv1TailStart = max(0, newMel.dim(1) - 2)
-        let newConv1Tail = newMel[0..., conv1TailStart..., 0...]
-        let conv1Out = gelu(conv1(conv1Input))
+        let (conv1Out, newConv1Tail) = stepConv(conv1, input: conv1Input, kernelSize: 3, stride: 1)
 
         let conv2Input: MLXArray
         if let conv2Tail {
@@ -239,15 +241,31 @@ final class VoxtralWhisperEncoder: Module {
         } else {
             conv2Input = causalPad(conv1Out, amount: 1)
         }
-
-        let conv2TailStart = max(0, conv1Out.dim(1) - 1)
-        let newConv2Tail = conv1Out[0..., conv2TailStart..., 0...]
-        let conv2Out = gelu(conv2(conv2Input))
+        let (conv2Out, newConv2Tail) = stepConv(conv2, input: conv2Input, kernelSize: 3, stride: 2)
 
         return (conv2Out, newConv1Tail, newConv2Tail)
     }
 
+    private func stepConv(
+        _ conv: Conv1d,
+        input: MLXArray,
+        kernelSize: Int,
+        stride: Int
+    ) -> (output: MLXArray, tail: MLXArray) {
+        let length = input.dim(1)
+        guard length >= kernelSize else {
+            let empty = MLXArray.zeros([input.dim(0), 0, conv.weight.dim(0)], dtype: input.dtype)
+            return (empty, input)
+        }
+
+        let outputs = (length - kernelSize) / stride + 1
+        let output = gelu(conv(input))
+        let tail = input[0..., (outputs * stride)..., 0...]
+        return (output, tail)
+    }
+
     func forwardTransformer(_ x: MLXArray, cache: [RotatingKVCache]?) -> MLXArray {
+        guard x.dim(1) > 0 else { return x }
         var out = x
         let mask: MLXFast.ScaledDotProductAttentionMaskMode = .causal
         for (idx, layer) in layers.enumerated() {
@@ -546,7 +564,7 @@ public final class VoxtralRealtime: Module {
             fixed = fixed[0..., 1...]
         }
 
-        let conv = encoder.forwardConv(fixed)
+        let conv = encoder.forwardConv(fixed.asType(encoder.conv1.weight.dtype))
         let seqLength = conv.dim(1)
         guard seqLength > 0 else {
             return MLXArray.zeros([0, config.dim], dtype: conv.dtype)
@@ -566,6 +584,11 @@ public final class VoxtralRealtime: Module {
             let encodedSegment = encoder.forwardTransformer(segment, cache: cache)
             chunks.append(encodedSegment)
             start = end
+
+            // Materialize each chunk and the cache state as we go. Otherwise the whole
+            // encoder graph for a long file is built lazily and evaluated at once, which
+            // is slow to construct and holds every intermediate alive until the end.
+            asyncEval([encodedSegment] + cache.flatMap { [$0.keys, $0.values] }.compactMap { $0 })
         }
 
         var encoded = concatenated(chunks, axis: 1)
@@ -598,32 +621,28 @@ public final class VoxtralRealtime: Module {
     ) {
         let melInput = expandedDimensions(newMel.transposed(1, 0), axis: 0).asType(encoder.conv1.weight.dtype)
         let conv = encoder.forwardConvStep(melInput, conv1Tail: conv1Tail, conv2Tail: conv2Tail)
-
         let cache = encoderCache ?? makeEncoderCache()
-        var encoded = encoder.forwardTransformer(conv.conv2Out, cache: cache)
-        encoded = encoded.squeezed(axis: 0)
 
+        var pieces: [MLXArray] = []
         if let downsampleBuffer {
-            encoded = concatenated([downsampleBuffer, encoded], axis: 0)
+            pieces.append(downsampleBuffer)
         }
+        if conv.conv2Out.dim(1) > 0 {
+            let encoded = encoder.forwardTransformer(conv.conv2Out, cache: cache)
+            pieces.append(encoded.squeezed(axis: 0))
+        }
+
+        guard !pieces.isEmpty else {
+            return (nil, conv.conv1Tail, conv.conv2Tail, cache, nil)
+        }
+        let encoded = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
 
         let nComplete = (encoded.dim(0) / downsampleFactor) * downsampleFactor
         guard nComplete > 0 else {
-            return (
-                nil,
-                conv.conv1Tail,
-                conv.conv2Tail,
-                cache,
-                encoded
-            )
+            return (nil, conv.conv1Tail, conv.conv2Tail, cache, encoded)
         }
 
-        let newBuffer: MLXArray?
-        if nComplete < encoded.dim(0) {
-            newBuffer = encoded[nComplete..., 0...]
-        } else {
-            newBuffer = nil
-        }
+        let newBuffer: MLXArray? = nComplete < encoded.dim(0) ? encoded[nComplete..., 0...] : nil
 
         let complete = encoded[0 ..< nComplete, 0...]
         let grouped = complete.reshaped(nComplete / downsampleFactor, -1)

@@ -130,35 +130,29 @@ public final class VoxtralTranscriber: @unchecked Sendable {
         let lastLogits = model.languageModel.project(lastHidden)
         var token = sampleToken(from: lastLogits, temperature: temperature)
         asyncEval(token)
-        var outputTokens: [Int] = []
 
         let totalDecodablePositions = availableAudioTokens - prefixLength
-        let maxOutputTokens = min(
-            maxNewTokens ?? (totalDecodablePositions + 1),
-            totalDecodablePositions + 1
+        let maxOutputTokens = max(
+            0,
+            min(
+                maxNewTokens ?? (totalDecodablePositions + 1),
+                totalDecodablePositions + 1
+            )
         )
 
+        var outputTokens: [Int] = []
+        outputTokens.reserveCapacity(maxOutputTokens)
+
         let decodeStart = DispatchTime.now().uptimeNanoseconds
-        if maxOutputTokens > 0 {
-            var emitted = 0
-            while emitted < maxOutputTokens {
-                let tokenID = token.item(Int.self)
-                if tokenID == tokenizer.eosID {
-                    break
-                }
-                outputTokens.append(tokenID)
-                emitted += 1
-
-                if emitted >= maxOutputTokens {
-                    break
-                }
-
-                let position = prefixLength + emitted - 1
-                if position >= availableAudioTokens {
-                    break
-                }
-
-                let nextToken = decodeStep(
+        while outputTokens.count < maxOutputTokens {
+            // Pipelining: enqueue the *next* step on the GPU before blocking on the
+            // current token, so graph construction overlaps with device execution.
+            // The extra step is wasted only when the current token turns out to be EOS.
+            let emitted = outputTokens.count
+            let position = prefixLength + emitted
+            var nextToken: MLXArray?
+            if emitted + 1 < maxOutputTokens, position < availableAudioTokens {
+                let next = decodeStep(
                     token: token,
                     position: position,
                     audioEmbeds: audioEmbeds,
@@ -167,15 +161,20 @@ public final class VoxtralTranscriber: @unchecked Sendable {
                     temperature: temperature,
                     adaScales: adaScales
                 )
-                asyncEval(nextToken)
-                token = nextToken
+                asyncEval(next)
+                nextToken = next
             }
+
+            let tokenID = token.item(Int.self)
+            if tokenID == tokenizer.eosID {
+                break
+            }
+            outputTokens.append(tokenID)
+
+            guard let nextToken else { break }
+            token = nextToken
         }
         let decodeEnd = DispatchTime.now().uptimeNanoseconds
-
-        if let last = outputTokens.last, last == tokenizer.eosID {
-            outputTokens.removeLast()
-        }
 
         let text = tokenizer.decode(outputTokens, ignoreSpecialTokens: true)
             .trimmingCharacters(in: .whitespacesAndNewlines)
