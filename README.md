@@ -77,6 +77,11 @@ The commands below assume you installed the precompiled release artifact and hav
 Useful options:
 - `--max-new-tokens` to cap generation length.
 - `--stats` to print timing and tokens/sec to stderr.
+- `--realtime` to push the file through the same streaming session that `live` uses,
+  in `--chunk-ms` sized pieces, printing text incrementally. With `--stats` it reports
+  the realtime factor and the slowest chunk; with `--verbose` it lists per-chunk timings
+  for the warm-up region and any chunk that exceeded its time budget. Handy for checking
+  streaming behaviour without a microphone.
 
 ### `live` (realtime microphone)
 
@@ -87,10 +92,20 @@ Useful options:
   --transcription-delay-ms 0 \
   --chunk-ms 80 \
   --decoder-window 2048 \
-  --max-backlog-ms 400
+  --max-backlog-ms 3000
 ```
 
-Stop with `Ctrl+C`.
+Before the microphone opens, the CLI pushes a short burst of silence through the model
+("Warming up model...") so first-use costs such as Metal pipeline creation are paid
+before any speech is captured. Without this, the first chunks stall, audio piles up and
+the garbled start gets decoded as nonsense.
+
+Stop with `Ctrl+C`. The CLI then stops capturing, flushes the audio and tokens still
+in flight, and prints the final text before exiting (press `Ctrl+C` twice to abort
+immediately). Status messages go to stderr, so stdout contains only the transcript.
+
+Microphone input is downmixed to mono and resampled to 16 kHz with a stateful
+`AVAudioConverter`, so any input device rate works without aliasing or drift.
 
 ## Acknowledgements
 

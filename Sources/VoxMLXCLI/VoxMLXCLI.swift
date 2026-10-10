@@ -54,15 +54,34 @@ extension VoxMLXCLI {
         @Flag(name: .long, help: "Print performance stats to stderr.")
         var stats = false
 
+        @Flag(
+            name: .long,
+            help: "Feed the file through the realtime streaming session (same path as `live`) in chunks and print text incrementally."
+        )
+        var realtime = false
+
+        @Option(name: .long, help: "Streaming chunk duration in milliseconds (with --realtime).")
+        var chunkMs: Float = 80
+
         mutating func run() async throws {
             let cacheBytes = try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
             logVerbose(shared.verbose, "mlx cache limit: \(shared.mlxCacheLimitMb) MB (\(cacheBytes) bytes)")
-            let audioURL = URL(fileURLWithPath: audio)
+            let audioPath = NSString(string: audio).expandingTildeInPath
+            guard FileManager.default.fileExists(atPath: audioPath) else {
+                throw ValidationError("Audio file not found: \(audio)")
+            }
+            let audioURL = URL(fileURLWithPath: audioPath)
             let transcriber = try await loadTranscriber(
                 model: model,
                 verbose: shared.verbose,
                 downloadBasePath: shared.downloadBasePath
             )
+
+            if realtime {
+                try runRealtimeSimulation(transcriber: transcriber, audioURL: audioURL)
+                return
+            }
+
             let result = try transcriber.transcribeWithStats(
                 audioURL: audioURL,
                 temperature: temp,
@@ -87,6 +106,69 @@ extension VoxMLXCLI {
                     stderr
                 )
             }
+        }
+
+        private func runRealtimeSimulation(transcriber: VoxtralTranscriber, audioURL: URL) throws {
+            let session = try VoxtralRealtimeSession(
+                transcriber: transcriber,
+                temperature: temp,
+                chunkDurationMs: chunkMs
+            )
+            let samples = try VoxtralAudio.loadAudio(url: audioURL)
+
+            var cursor = 0
+            var chunkIndex = 0
+            var maxChunkSeconds = 0.0
+            var chunksOverBudget = 0
+            var reportedChunks: [(index: Int, seconds: Double)] = []
+            let start = DispatchTime.now().uptimeNanoseconds
+            while cursor < samples.count {
+                let end = min(samples.count, cursor + session.chunkSamples)
+                let chunkStart = DispatchTime.now().uptimeNanoseconds
+                let text = session.appendAudioSamples(Array(samples[cursor ..< end]))
+                let chunkSeconds = Double(DispatchTime.now().uptimeNanoseconds - chunkStart) / 1e9
+                maxChunkSeconds = max(maxChunkSeconds, chunkSeconds)
+                let overBudget = chunkSeconds > Double(session.tokenDurationMs) / 1000.0
+                if overBudget {
+                    chunksOverBudget += 1
+                }
+                // Verbose mode lists the warm-up region (first chunks) plus any stalls.
+                if overBudget || chunkIndex < 12 {
+                    reportedChunks.append((chunkIndex, chunkSeconds))
+                }
+                emit(text)
+                cursor = end
+                chunkIndex += 1
+            }
+            emit(session.finishStream())
+            emit("\n")
+            let total = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+
+            if stats {
+                let audioSeconds = Double(samples.count) / Double(VoxtralAudio.sampleRate)
+                fputs(
+                    String(
+                        format: "stats: audio=%.3fs total=%.3fs realtime_factor=%.2fx chunks=%d max_chunk=%.3fs chunks_over_budget=%d\n",
+                        audioSeconds,
+                        total,
+                        audioSeconds / max(total, 1e-9),
+                        chunkIndex,
+                        maxChunkSeconds,
+                        chunksOverBudget
+                    ),
+                    stderr
+                )
+            }
+            if shared.verbose {
+                for entry in reportedChunks.prefix(32) {
+                    fputs(String(format: "[voxmlx] chunk %d took %.3fs\n", entry.index, entry.seconds), stderr)
+                }
+            }
+        }
+
+        private func emit(_ text: String) {
+            guard !text.isEmpty else { return }
+            FileHandle.standardOutput.write(Data(text.utf8))
         }
     }
 
@@ -117,10 +199,26 @@ extension VoxMLXCLI {
         @Option(name: .long, help: "Decoder KV sliding window size (tokens). Smaller = lower latency and memory.")
         var decoderWindow: Int = 2048
 
-        @Option(name: .long, help: "Max buffered microphone backlog before dropping stale audio (ms).")
-        var maxBacklogMs: Float = 400
+        @Option(
+            name: .long,
+            help: "Max buffered microphone backlog before dropping stale audio (ms). The session runs several times faster than realtime, so a generous limit lets it catch up after a stall instead of cutting a hole in the speech."
+        )
+        var maxBacklogMs: Float = 3000
 
         mutating func run() async throws {
+            guard chunkMs > 0 else {
+                throw ValidationError("--chunk-ms must be > 0.")
+            }
+            guard rightPadTokens >= 0 else {
+                throw ValidationError("--right-pad-tokens must be >= 0.")
+            }
+            guard decoderWindow > 0 else {
+                throw ValidationError("--decoder-window must be > 0.")
+            }
+            guard maxBacklogMs > 0 else {
+                throw ValidationError("--max-backlog-ms must be > 0.")
+            }
+
             try await ensureMicrophonePermission(verbose: shared.verbose)
             let cacheBytes = try configureMLXCacheLimit(cacheLimitMB: shared.mlxCacheLimitMb)
             logVerbose(shared.verbose, "mlx cache limit: \(shared.mlxCacheLimitMb) MB (\(cacheBytes) bytes)")
@@ -137,32 +235,92 @@ extension VoxMLXCLI {
                 rightPadTokens: rightPadTokens,
                 decoderWindowTokens: decoderWindow
             )
-            try runMicrophone(session: session, maxBacklogMs: maxBacklogMs)
+            try runMicrophone(session: session, maxBacklogMs: maxBacklogMs, verbose: shared.verbose)
         }
 
-        private func runMicrophone(session: VoxtralRealtimeSession, maxBacklogMs: Float) throws {
+        private func runMicrophone(session: VoxtralRealtimeSession, maxBacklogMs: Float, verbose: Bool) throws {
             let source = try MicrophoneChunkSource(chunkSamples: session.chunkSamples)
-            print("Listening... (Ctrl+C to stop)")
+            let shutdown = ShutdownSignal()
+            shutdown.install { source.requestStop() }
+
+            // Pay first-use costs (Metal pipelines, weight page-in) before any speech is
+            // captured; otherwise the first chunks stall, audio queues up or gets dropped,
+            // and the model decodes a garbled start.
+            fputs("Warming up model...\n", stderr)
+            let warmSeconds = session.warmUp()
+            logVerbose(verbose, String(format: "warm-up took %.2fs", warmSeconds))
 
             try source.start()
-            defer {
-                source.stop()
-            }
+            logVerbose(verbose, "microphone input: \(source.inputDescription)")
+            fputs("Listening... (Ctrl+C to stop)\n", stderr)
 
             let maxBacklogChunks = max(1, Int(Foundation.ceil(maxBacklogMs / session.tokenDurationMs)))
-            while true {
-                if let chunk = source.popChunk(maxBacklogChunks: maxBacklogChunks) {
-                    emit(session.appendAudioSamples(chunk))
-                } else {
-                    Thread.sleep(forTimeInterval: 0.002)
+            var reportedDrops = 0
+            while !source.stopRequested {
+                guard let chunk = source.popChunk(maxBacklogChunks: maxBacklogChunks, timeout: 0.25) else {
+                    continue
                 }
+                emit(session.appendAudioSamples(chunk))
+
+                let dropped = source.droppedChunkCount
+                if dropped > reportedDrops {
+                    let ms = Float(dropped - reportedDrops) * session.tokenDurationMs
+                    fputs(
+                        String(format: "\n[voxmlx] warning: dropped %.0f ms of audio, transcription cannot keep up\n", ms),
+                        stderr
+                    )
+                    reportedDrops = dropped
+                }
+            }
+
+            // Ctrl+C: stop capturing, then flush whatever audio and tokens are still pending
+            // so the tail of the utterance is not lost.
+            source.stop()
+            let dropped = source.droppedChunkCount
+            for chunk in source.drainChunks() {
+                emit(session.appendAudioSamples(chunk))
+            }
+            let remainder = source.consumeRemainder()
+            if !remainder.isEmpty {
+                emit(session.appendAudioSamples(remainder))
+            }
+            emit(session.finishStream())
+            emit("\n")
+            if dropped > 0 {
+                logVerbose(verbose, "dropped \(dropped) stale microphone chunk(s) in total")
             }
         }
 
         private func emit(_ text: String) {
             guard !text.isEmpty else { return }
             FileHandle.standardOutput.write(Data(text.utf8))
-            fflush(stdout)
+        }
+    }
+}
+
+/// Turns SIGINT/SIGTERM into a cooperative stop. A second signal exits immediately.
+private final class ShutdownSignal: @unchecked Sendable {
+    private var sources: [DispatchSourceSignal] = []
+    private let lock = NSLock()
+    private var fired = false
+
+    func install(_ onStop: @escaping @Sendable () -> Void) {
+        for sig in [SIGINT, SIGTERM] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global(qos: .userInteractive))
+            source.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let alreadyFired = self.fired
+                self.fired = true
+                self.lock.unlock()
+                if alreadyFired {
+                    _exit(130)
+                }
+                onStop()
+            }
+            source.resume()
+            sources.append(source)
         }
     }
 }
@@ -263,32 +421,66 @@ private func logVerbose(_ enabled: Bool, _ message: @autoclosure () -> String) {
     fputs("[voxmlx] \(message())\n", stderr)
 }
 
-private final class MicrophoneChunkSource {
+private final class MicrophoneChunkSource: @unchecked Sendable {
     private let engine = AVAudioEngine()
-    private let lock = NSLock()
+    private let condition = NSCondition()
     private let chunkSamples: Int
     private var chunkQueue: [[Float]] = []
     private var chunkQueueStart = 0
     private var sampleBuffer: [Float] = []
     private var sampleBufferStart = 0
+    private var monoScratch: [Float] = []
+    private var resampler: VoxtralAudioResampler?
+    private var stopFlag = false
+    private var dropped = 0
+    private(set) var inputDescription = "unknown"
 
     init(chunkSamples: Int) throws {
         self.chunkSamples = chunkSamples
     }
 
+    var stopRequested: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return stopFlag
+    }
+
+    var droppedChunkCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return dropped
+    }
+
+    func requestStop() {
+        condition.lock()
+        stopFlag = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
     func start() throws {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
-        guard let tapFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: inputFormat.sampleRate,
-            channels: inputFormat.channelCount,
-            interleaved: false
-        ) else {
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
+              let tapFormat = AVAudioFormat(
+                  commonFormat: .pcmFormatFloat32,
+                  sampleRate: inputFormat.sampleRate,
+                  channels: inputFormat.channelCount,
+                  interleaved: false
+              )
+        else {
             throw MicrophoneChunkSourceError.invalidTapFormat
         }
 
-        input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(chunkSamples), format: tapFormat) { [weak self] buffer, _ in
+        let inputRate = Int(inputFormat.sampleRate.rounded())
+        resampler = VoxtralAudioResampler(inputRate: inputRate, outputRate: VoxtralAudio.sampleRate)
+        inputDescription = "\(inputRate) Hz, \(inputFormat.channelCount) ch -> \(VoxtralAudio.sampleRate) Hz mono"
+
+        // Ask for roughly one model chunk per callback at the input rate.
+        let tapFrames = AVAudioFrameCount(
+            max(256, Int((Double(chunkSamples) * inputFormat.sampleRate / Double(VoxtralAudio.sampleRate)).rounded()))
+        )
+        input.installTap(onBus: 0, bufferSize: tapFrames, format: tapFormat) { [weak self] buffer, _ in
             self?.handleBuffer(buffer)
         }
 
@@ -299,33 +491,62 @@ private final class MicrophoneChunkSource {
     func stop() {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+
+        // Flush the resampler's filter delay into the sample buffer.
+        if let resampler {
+            let tail = resampler.finish()
+            if !tail.isEmpty {
+                condition.lock()
+                sampleBuffer.append(contentsOf: tail)
+                condition.unlock()
+            }
+        }
     }
 
-    func popChunk(maxBacklogChunks: Int) -> [Float]? {
-        lock.lock()
-        defer { lock.unlock() }
+    /// Returns the next chunk, waiting up to `timeout` seconds for one to arrive.
+    /// Stale chunks beyond `maxBacklogChunks` are dropped so latency stays bounded.
+    func popChunk(maxBacklogChunks: Int, timeout: TimeInterval) -> [Float]? {
+        condition.lock()
+        defer { condition.unlock() }
+
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while chunkQueueStart >= chunkQueue.count, !stopFlag {
+            if !condition.wait(until: deadline) {
+                break
+            }
+        }
+
         guard chunkQueueStart < chunkQueue.count else {
             chunkQueue.removeAll(keepingCapacity: true)
             chunkQueueStart = 0
             return nil
         }
+
         let backlog = chunkQueue.count - chunkQueueStart
         if backlog > maxBacklogChunks {
             let toDrop = backlog - maxBacklogChunks
             chunkQueueStart += toDrop
+            dropped += toDrop
         }
         let chunk = chunkQueue[chunkQueueStart]
         chunkQueueStart += 1
-        if chunkQueueStart > 64, chunkQueueStart * 2 >= chunkQueue.count {
-            chunkQueue.removeFirst(chunkQueueStart)
-            chunkQueueStart = 0
-        }
+        compactQueueLocked()
         return chunk
     }
 
+    /// Removes and returns every queued chunk (used while shutting down).
+    func drainChunks() -> [[Float]] {
+        condition.lock()
+        defer { condition.unlock() }
+        let chunks = Array(chunkQueue[chunkQueueStart...])
+        chunkQueue.removeAll(keepingCapacity: true)
+        chunkQueueStart = 0
+        return chunks
+    }
+
     func consumeRemainder() -> [Float] {
-        lock.lock()
-        defer { lock.unlock() }
+        condition.lock()
+        defer { condition.unlock() }
         let remainder: [Float]
         if sampleBufferStart < sampleBuffer.count {
             remainder = Array(sampleBuffer[sampleBufferStart...])
@@ -337,47 +558,44 @@ private final class MicrophoneChunkSource {
         return remainder
     }
 
-    private func handleBuffer(_ buffer: AVAudioPCMBuffer) {
-        let frames = Int(buffer.frameLength)
-        guard frames > 0, let channelData = buffer.floatChannelData else { return }
-
-        let channels = Int(buffer.format.channelCount)
-        var mono = Array(repeating: Float(0), count: frames)
-
-        if channels == 1 {
-            let src = channelData[0]
-            for i in 0 ..< frames {
-                mono[i] = src[i]
-            }
-        } else {
-            for c in 0 ..< channels {
-                let src = channelData[c]
-                for i in 0 ..< frames {
-                    mono[i] += src[i]
-                }
-            }
-            let scale = 1.0 / Float(channels)
-            for i in 0 ..< frames {
-                mono[i] *= scale
-            }
+    private func compactQueueLocked() {
+        if chunkQueueStart == chunkQueue.count {
+            chunkQueue.removeAll(keepingCapacity: true)
+            chunkQueueStart = 0
+        } else if chunkQueueStart > 64, chunkQueueStart * 2 >= chunkQueue.count {
+            chunkQueue.removeFirst(chunkQueueStart)
+            chunkQueueStart = 0
         }
+    }
 
-        let inputRate = Int(round(buffer.format.sampleRate))
-        let resampled = VoxtralAudio.resampleToModelRate(mono, inputRate: inputRate)
+    private func handleBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard buffer.frameLength > 0, let resampler else { return }
 
-        lock.lock()
+        VoxtralAudio.monoSamples(from: buffer, into: &monoScratch)
+        let resampled = resampler.process(monoScratch)
+        guard !resampled.isEmpty else { return }
+
+        condition.lock()
         sampleBuffer.append(contentsOf: resampled)
+        var appended = false
         while sampleBuffer.count - sampleBufferStart >= chunkSamples {
             let start = sampleBufferStart
             let end = start + chunkSamples
             chunkQueue.append(Array(sampleBuffer[start ..< end]))
             sampleBufferStart = end
+            appended = true
         }
-        if sampleBufferStart > 32_768, sampleBufferStart * 2 >= sampleBuffer.count {
+        if sampleBufferStart == sampleBuffer.count {
+            sampleBuffer.removeAll(keepingCapacity: true)
+            sampleBufferStart = 0
+        } else if sampleBufferStart > 32_768, sampleBufferStart * 2 >= sampleBuffer.count {
             sampleBuffer.removeFirst(sampleBufferStart)
             sampleBufferStart = 0
         }
-        lock.unlock()
+        if appended {
+            condition.signal()
+        }
+        condition.unlock()
     }
 }
 
