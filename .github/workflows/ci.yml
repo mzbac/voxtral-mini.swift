@@ -48,8 +48,31 @@ jobs:
           fi
 
       - name: Run tests
+        env:
+          # The hosted runner's paravirtualized GPU cannot compile MLX's tensor-core
+          # GEMM kernels, which aborts the test process on the first matmul. Run the
+          # MLX suite on the CPU backend instead (xcodebuild forwards TEST_RUNNER_*
+          # variables to the test process without the prefix).
+          TEST_RUNNER_VOXMLX_TEST_DEVICE: cpu
         run: |
-          xcodebuild test -scheme VoxMLX-Package -destination 'platform=macOS' -derivedDataPath ./build -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO
+          set -o pipefail
+          xcodebuild test -scheme VoxMLX-Package -destination 'platform=macOS' -derivedDataPath ./build -resultBundlePath ./build/VoxMLXTests.xcresult -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO 2>&1 | tee ./build/xcodebuild-test.log
+
+      - name: Summarize test failures
+        if: failure()
+        run: |
+          echo "## Failing tests" >> "$GITHUB_STEP_SUMMARY"
+          grep -E '✘|error:|Test Case .* failed|crashed|Fatal error|MLX error' ./build/xcodebuild-test.log | head -100 | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            ./build/VoxMLXTests.xcresult
+            ./build/xcodebuild-test.log
+          if-no-files-found: ignore
 
   build:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

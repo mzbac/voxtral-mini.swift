@@ -55,7 +55,38 @@ private func tinyParams() throws -> VoxtralParams {
 /// threads at once. swift-testing runs tests in parallel by default, so every test
 /// that touches MLX lives in this serialized suite.
 @Suite(.serialized)
-struct MLXTests {}
+struct MLXTests {
+    init() {
+        MLXTestDevice.configure()
+    }
+}
+
+/// Selects the MLX backend for the suite from `VOXMLX_TEST_DEVICE` (`cpu` or `gpu`).
+///
+/// GitHub's hosted macOS runners expose a paravirtualized GPU that reports a
+/// tensor-core capable architecture but whose Metal compiler cannot build MLX's
+/// `steel_gemm_fused_nax` kernels ("unsupported deferred-static-alloca-size function
+/// body"). The first matmul then aborts the whole test process. CI sets the variable
+/// to `cpu`; locally the GPU remains the default.
+private enum MLXTestDevice {
+    private static let configured: Void = {
+        let requested = ProcessInfo.processInfo.environment["VOXMLX_TEST_DEVICE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch requested {
+        case "cpu":
+            Device.setDefault(device: Device(.cpu))
+        case "gpu":
+            Device.setDefault(device: Device(.gpu))
+        default:
+            break
+        }
+    }()
+
+    static func configure() {
+        _ = configured
+    }
+}
 
 // MARK: - Mel framing
 
